@@ -1,0 +1,15 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bladder_cancer
+    environment:
+      - APP_ENV=production
+    restart: unless-stopped
+    networks:
+      - main_network
+
+networks:
+  main_network:
+    external: true

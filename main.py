@@ -1,178 +1,223 @@
-import os
-import uuid
 import numpy as np
-from PIL import Image
 import torch
+import cv2
+import base64
+from io import BytesIO
+from PIL import Image
+
 from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
+
 from torchvision import transforms
 from ultralytics import YOLO
-import cv2
 
-# === FastAPI setup ===
+# ======================
+# FastAPI setup
+# ======================
 app = FastAPI()
-app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-UPLOAD_FOLDER = os.path.join("static", "uploads")
-RESULT_FOLDER = os.path.join("static", "results")
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(RESULT_FOLDER, exist_ok=True)
+# ======================
+# Load models
+# ======================
+yolo_model = YOLO("Model/best.pt")
 
-# === Load models ===
-yolo_model = YOLO("Model/best.pt")  # YOLO ตรวจจับก้อนเนื้อ
-vgg19_path = os.path.join("Model/resnet101_web_model_v.1.pt")
+cls_model_path = "Model/resnet101_web_model_v.1.pt"
 class_names = ["T1", "T2", "T3", "T4"]
 
-vgg19 = torch.load(vgg19_path, map_location="cpu")
-vgg19.eval()
+cls_model = torch.load(cls_model_path, map_location="cpu")
+cls_model.eval()
 
+# ======================
+# Image transform
+# ======================
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225])
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    )
 ])
 
-# === Stage colors (BGR สำหรับ OpenCV) ===
+# ======================
+# Stage colors (BGR)
+# ======================
 stage_colors = {
-    "T1": (0, 200, 0),      # เขียว
-    "T2": (0, 255, 255),    # เหลือง
-    "T3": (0, 128, 255),    # ส้ม
-    "T4": (0, 0, 255),      # แดง
+    "T1": (0, 200, 0),      # Green
+    "T2": (0, 255, 255),    # Yellow
+    "T3": (0, 128, 255),    # Orange
+    "T4": (0, 0, 255),      # Red
 }
 
-# === Detection + Classification ===
-def detect_and_predict(image_path, result_path):
-    try:
-        image = np.array(Image.open(image_path).convert("RGB"))
-        orig_image = image.copy()
+# ======================
+# Detection + Classification
+# ======================
+def detect_and_predict(image_np: np.ndarray):
+    orig_image = image_np.copy()
 
-        results = yolo_model(image)
-        boxes = results[0].boxes.xyxy.cpu().numpy() if results[0].boxes is not None else []
+    results = yolo_model(image_np)
+    boxes = (
+        results[0].boxes.xyxy.cpu().numpy()
+        if results[0].boxes is not None
+        else []
+    )
 
-        predicted_labels = []        # [(pred_class, confidence)]
-        all_probs = []               # [[prob_T1, prob_T2, prob_T3, prob_T4], ...]
+    predicted_labels = []
+    all_probs = []
 
-        for box in boxes:
-            x1, y1, x2, y2 = map(int, box)
-            roi = image[y1:y2, x1:x2]
-            if roi.size == 0:
-                continue
+    for box in boxes:
+        x1, y1, x2, y2 = map(int, box)
+        roi = image_np[y1:y2, x1:x2]
+        if roi.size == 0:
+            continue
 
-            roi_pil = Image.fromarray(roi).resize((224,224))
-            roi_tensor = transform(roi_pil).unsqueeze(0)
+        roi_pil = Image.fromarray(roi)
+        roi_tensor = transform(roi_pil).unsqueeze(0)
 
-            with torch.no_grad():
-                outputs = vgg19(roi_tensor)
-                probs = torch.softmax(outputs, dim=1).cpu().numpy()[0]
-                all_probs.append(probs.tolist())
+        with torch.no_grad():
+            logits = cls_model(roi_tensor)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
 
-                pred_idx = np.argmax(probs)
-                predicted_class = class_names[pred_idx]
-                confidence = probs[pred_idx]
-                predicted_labels.append((predicted_class, float(confidence)))
+        all_probs.append(probs.tolist())
 
-            # วาดกรอบรอบบริเวณ
-            color = stage_colors.get(predicted_class, (0, 255, 0))
-            cv2.rectangle(orig_image, (x1, y1), (x2, y2), color, 2)
+        idx = int(np.argmax(probs))
+        stage = class_names[idx]
+        conf = float(probs[idx])
+        predicted_labels.append((stage, conf))
 
-            # Label overlay
-            label_text = f"{predicted_class} {confidence:.2f}"
-            ((text_width, text_height), _) = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            cv2.rectangle(orig_image, (x1, max(0, y1 - text_height - 4)),
-                          (x1 + text_width, y1), color, -1)
-            cv2.putText(orig_image, label_text, (x1, max(0, y1-4)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        # ===== Draw bounding box (FIXED) =====
+        color = stage_colors.get(stage, (255, 255, 255))
+        cv2.rectangle(orig_image, (x1, y1), (x2, y2), color, 2)
 
-        cv2.imwrite(result_path, cv2.cvtColor(orig_image, cv2.COLOR_RGB2BGR))
-        return predicted_labels, all_probs
+        # ===== Label with background =====
+        label = f"{stage}"
+        (tw, th), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+        )
 
-    except Exception as e:
-        print("Error in detect_and_predict:", e)
-        return [], []
+        cv2.rectangle(
+            orig_image,
+            (x1, y1 - th - 8),
+            (x1 + tw + 6, y1),
+            color,
+            -1
+        )
 
+        cv2.putText(
+            orig_image,
+            label,
+            (x1 + 3, y1 - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2
+        )
 
-# === Routes ===
+    # ===== Convert result image to base64 =====
+    _, buffer = cv2.imencode(
+        ".jpg",
+        cv2.cvtColor(orig_image, cv2.COLOR_RGB2BGR)
+    )
+    img_base64 = base64.b64encode(buffer).decode("utf-8")
+
+    return predicted_labels, all_probs, img_base64
+
+# ======================
+# Routes
+# ======================
 @app.get("/", response_class=HTMLResponse)
-async def read_root(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
-
-@app.get("/index.html", response_class=HTMLResponse) 
-async def read_index(request: Request): 
+async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 @app.get("/contact.html", response_class=HTMLResponse)
-async def read_contact(request: Request):
+async def contact(request: Request):
     return templates.TemplateResponse("contact.html", {"request": request})
 
-
-# === Process uploaded image ===
 @app.post("/contact.html", response_class=HTMLResponse)
 async def process_contact(request: Request, file: UploadFile = File(...)):
-    try:
-        # Save uploaded file
-        filename = f"{uuid.uuid4().hex}_{file.filename}"
-        upload_path = os.path.join(UPLOAD_FOLDER, filename)
-        with open(upload_path, "wb") as f:
-            f.write(await file.read())
 
-        # Result image path
-        result_filename = f"result_{filename}"
-        result_path = os.path.join(RESULT_FOLDER, result_filename)
+    image_bytes = await file.read()
+    pil_image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    image_np = np.array(pil_image)
 
-        # Detect + classify
-        predictions, all_probs = detect_and_predict(upload_path, result_path)
+    predictions, all_probs, result_img_b64 = detect_and_predict(image_np)
 
-        # ✅ เฉลี่ยความน่าจะเป็นทุก class (T1–T4)
-        if all_probs:
-            avg_probs = np.mean(np.array(all_probs), axis=0)
-            percentages = {cls: float(p) * 100 for cls, p in zip(class_names, avg_probs)}
-            dominant_stage = class_names[int(np.argmax(avg_probs))]
-        else:
-            percentages = {cls: 0.0 for cls in class_names}
-            dominant_stage = None
+    # ===== Average probabilities =====
+    if all_probs:
+        avg_probs = np.mean(np.array(all_probs), axis=0)
+        percentages = {
+            cls: float(p) * 100
+            for cls, p in zip(class_names, avg_probs)
+        }
+        dominant_stage = class_names[int(np.argmax(avg_probs))]
+    else:
+        percentages = {cls: 0.0 for cls in class_names}
+        dominant_stage = None
 
-        # === HTML response ===
-        pred_html = f"""
-        <div class="text-center">
-            <h4>Uploaded Image</h4>
-            <img src="/static/uploads/{filename}" class="preview-image">
+    html = f"""
+    <style>
+        .preview-image {{
+            max-width: 500px;
+            border-radius: 14px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+        }}
+        .center {{
+            text-align: center;
+            font-size: 2.5rem;
+        }}
+        .badge {{
+            display: inline-block;
+            padding: 8px 18px;
+            border-radius: 14px;
+            font-weight: bold;
+            margin: 6px 0;
+            color: white;
+        }}
+        .t1 {{ background: #2ecc71; }}
+        .t2 {{ background: #f1c40f; }}
+        .t3 {{ background: #e67e22; }}
+        .t4 {{ background: #e74c3c; }}
+    </style>
+
+    <div class="center">
+        <h4>Result Image</h4>
+        <img src="data:image/jpeg;base64,{result_img_b64}" class="preview-image">
+    </div>
+
+    <div class="center" style="margin-top:20px;">
+        <h5>Predictions per bounding box:</h5>
+    """
+
+    if predictions:
+        for cls, conf in predictions:
+            html += f"""
+            <div class="badge {cls.lower()}">
+                {cls} — {conf:.2f}
+            </div>
+            """
+    else:
+        html += "<p>No detection</p>"
+
+    html += "<h5 style='margin-top:25px;'>Stage Probabilities:</h5>"
+
+    for cls in class_names:
+        html += f"""
+        <div class="badge {cls.lower()}">
+            {cls}: {percentages[cls]:.1f}%
         </div>
-        <div class="text-center mt-3">
-            <h4>Result Image</h4>
-            <img src="/static/results/{result_filename}" class="preview-image">
-        </div>
-        <div class="mt-3">
-            <h5>Predictions per bounding box:</h5>
-            <ul class="label-list">
         """
-        if predictions:
-            for cls, conf in predictions:
-                color_class = f"stage-{cls.lower()}"
-                pred_html += f"<li><span class='stage-label {color_class}'>{cls} — {conf:.2f}</span></li>"
-        else:
-            pred_html += "<li>No detection</li>"
-        pred_html += "</ul>"
 
-        # ✅ แสดงความน่าจะเป็นของทุก class T1–T4
-        pred_html += "<div class='mt-2'><h5>Stage Probabilities (Averaged across detections):</h5><ul>"
-        for cls in class_names:
-            pct = percentages[cls]
-            color_class = f"stage-{cls.lower()}"
-            pred_html += f"<li><span class='stage-label {color_class}'>{cls}: {pct:.1f}%</span></li>"
-        pred_html += "</ul>"
+    if dominant_stage:
+        html += f"""
+        <div style="margin-top:30px;">
+            <h5>Dominant Stage</h5>
+            <div class="badge {dominant_stage.lower()}"
+                 style="font-size:2.5rem; padding:12px 28px;">
+                {dominant_stage}
+            </div>
+        </div>
+        """
 
-        # Dominant Stage
-        if dominant_stage:
-            color_class = f"stage-{dominant_stage.lower()}"
-            pred_html += f"<p><strong>Dominant Stage: <span class='stage-label {color_class}'>{dominant_stage}</span></strong></p>"
-        pred_html += "</div>"
-
-        return HTMLResponse(content=pred_html)
-
-    except Exception as e:
-        print("Error in process_contact:", e)
-        return HTMLResponse(content="<p style='color:red;'>เกิดข้อผิดพลาดในการประมวลผลไฟล์</p>")
+    return HTMLResponse(content=html)

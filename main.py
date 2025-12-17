@@ -1,14 +1,14 @@
+import os
 import numpy as np
 import torch
 import cv2
 import base64
 from io import BytesIO
 from PIL import Image
-
+from fastapi.staticfiles import StaticFiles
 from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-
 from torchvision import transforms
 from ultralytics import YOLO
 
@@ -16,6 +16,7 @@ from ultralytics import YOLO
 # FastAPI setup
 # ======================
 app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
 # ======================
@@ -127,13 +128,19 @@ def detect_and_predict(image_np: np.ndarray):
 # ======================
 # Routes
 # ======================
+# === Routes ===
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
+async def read_root(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.get("/index.html", response_class=HTMLResponse) 
+async def read_index(request: Request): 
     return templates.TemplateResponse("index.html", {"request": request})
 
 @app.get("/contact.html", response_class=HTMLResponse)
-async def contact(request: Request):
+async def read_contact(request: Request):
     return templates.TemplateResponse("contact.html", {"request": request})
+
 
 @app.post("/contact.html", response_class=HTMLResponse)
 async def process_contact(request: Request, file: UploadFile = File(...)):

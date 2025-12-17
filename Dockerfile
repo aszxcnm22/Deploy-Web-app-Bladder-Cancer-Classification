@@ -1,7 +1,10 @@
-FROM python:3.12.10
+FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglx-mesa0 \
     libglib2.0-0 \
     build-essential \
     zlib1g-dev \
@@ -12,14 +15,13 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY requirements.txt .
+RUN pip install --upgrade pip setuptools wheel
 
-# ติดตั้ง pip setuptools ก่อนเพื่อป้องกัน pkg_resources error
-RUN pip install --upgrade pip setuptools
-
+# กัน ultralytics เพี้ยน/ซ้อน
+RUN pip uninstall -y ultralytics ultralytics-thop thop || true
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
 EXPOSE 8000
-
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
